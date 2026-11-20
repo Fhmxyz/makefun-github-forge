@@ -268,7 +268,9 @@ function commitJson(store: Store, repo: Repo, oid: string): Record<string, unkno
     sha: oid,
     node_id: nodeId('Commit', `${repo.owner}/${repo.name}:${oid}`),
     commit: {
-      message: commit.message,
+      // GitHub's API returns the message without the trailing newline the
+      // on-disk commit format appends.
+      message: commit.message.replace(/\n+$/, ''),
       author: { name: authorName, email: authorEmail, date },
       committer: { name: committerName, email: committerEmail, date },
       tree: { sha: commit.tree, url: `/api/v3/repos/${repo.owner}/${repo.name}/git/trees/${commit.tree}` },
@@ -546,7 +548,10 @@ export function pullFiles(repo: Repo, pull: Pull): Record<string, unknown>[] {
  */
 export function mergePull(store: Store, repo: Repo, pull: Pull, message: string): { ok: true; sha: string } | { ok: false } {
   if (pull.baseSha === null || pull.headSha === null) return { ok: false };
-  const baseTip = pull.baseSha;
+  // The base tip is read live: a pull request created before another pull
+  // merged must conflict against the current base, not the stale base tip
+  // recorded at creation time.
+  const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
   const headTip = pull.headSha;
   const base = mergeBase(repo, headTip, baseTip);
   const baseTree = base === null ? null : treeOfCommit(repo, base);
