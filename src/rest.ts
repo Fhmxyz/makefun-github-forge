@@ -608,6 +608,9 @@ export function handleRest(
     return;
   }
   const input = parsed.value;
+  // Link headers carry absolute URLs (GitHub's form; a relative URL fails the
+  // suite's sameOrigin check on the followed page).
+  const linkBase = `http://${req.headers.host ?? '127.0.0.1'}${path}`;
 
   // GET /api/v3/ — the API root.
   if (rest.length === 0) {
@@ -706,7 +709,7 @@ export function handleRest(
   // /api/v3/user/repos
   if (rest.length === 2 && rest[0] === 'user' && rest[1] === 'repos') {
     if (method === 'GET') {
-      const page = paginate(store.listRepos(), query, path);
+      const page = paginate(store.listRepos(), query, linkBase);
       sendJson(res, 200, page.items.map((repo) => repoJson(store, repo)), page.link ? { link: page.link } : {});
       return;
     }
@@ -747,7 +750,7 @@ export function handleRest(
       notFound(res);
       return;
     }
-    handleRepoRoute(store, req, res, repo, rest.slice(3), method, query, input, path);
+    handleRepoRoute(store, req, res, repo, rest.slice(3), method, query, input, linkBase);
     return;
   }
 
@@ -876,6 +879,48 @@ function handleRepoRoute(
 
   // ---- git refs / trees / commits
   if (section === 'git') {
+    if (rest[1] === 'refs' && rest.length === 2) {
+      if (method === 'GET') {
+        const refs = [...repo.refs.entries()]
+          .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+          .map(([ref, oid]) => ({
+            ref,
+            node_id: nodeId('Ref', `${repo.owner}/${repo.name}:${ref}`),
+            url: `${baseUrl}/git/${ref}`,
+            object: { sha: oid, type: repo.objects.get(oid)?.type ?? 'commit', url: `${baseUrl}/git/commits/${oid}` },
+          }));
+        const page = paginate(refs, query, path);
+        sendJson(res, 200, page.items, page.link ? { link: page.link } : {});
+        return;
+      }
+      if (method === 'POST') {
+        const ref = asString(input.ref);
+        const sha = asString(input.sha);
+        if (ref === '' || !ref.startsWith('refs/')) {
+          sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Reference', field: 'ref', code: 'invalid' }] });
+          return;
+        }
+        if (sha === '' || !/^[0-9a-f]{40}$/.test(sha) || !repo.objects.has(sha)) {
+          sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Reference', field: 'sha', code: 'invalid' }] });
+          return;
+        }
+        if (repo.refs.has(ref)) {
+          sendJson(res, 422, { message: 'Validation Failed', errors: [{ resource: 'Reference', field: 'ref', code: 'already_exists' }] });
+          return;
+        }
+        repo.refs.set(ref, sha);
+        const object = repo.objects.get(sha);
+        sendJson(res, 201, {
+          ref,
+          node_id: nodeId('Ref', `${repo.owner}/${repo.name}:${ref}`),
+          url: `${baseUrl}/git/${ref}`,
+          object: { sha, type: object?.type ?? 'commit', url: `${baseUrl}/git/commits/${sha}` },
+        });
+        return;
+      }
+      notFound(res);
+      return;
+    }
     if (rest[1] === 'refs' && rest.length >= 3 && method === 'GET') {
       const refName = rest.slice(2).join('/');
       const full = refName.startsWith('refs/') ? refName : `refs/${refName}`;
@@ -1166,7 +1211,19 @@ function handleIssues(
         if (state !== 'all' && pull.state !== state) continue;
         items.push(pullAsIssueJson(store, repo, pull));
       }
-      items.sort((a, b) => (b.number as number) - (a.number as number));
+      // ?sort=created|updated|comments & ?direction=asc|desc (default: created desc).
+      const sortField = query.get('sort') ?? 'created';
+      const direction = query.get('direction') === 'asc' ? 1 : -1;
+      const seqOf = (item: Record<string, unknown>): number => {
+        if (sortField === 'comments') return typeof item.comments === 'number' ? item.comments : 0;
+        if (sortField === 'updated') return Date.parse(String(item.updated_at ?? '')) || 0;
+        return Date.parse(String(item.created_at ?? '')) || 0;
+      };
+      items.sort((a, b) => {
+        const diff = seqOf(a) - seqOf(b);
+        if (diff !== 0) return diff * direction;
+        return ((a.number as number) - (b.number as number)) * direction;
+      });
       const page = paginate(items, query, path);
       sendJson(res, 200, page.items, page.link ? { link: page.link } : {});
       return;

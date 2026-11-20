@@ -657,9 +657,35 @@ export function planFetch(repo: Repo, request: FetchRequest): FetchPlan {
     if (cut) shallow.push(oid);
     else if (clientShallow.has(oid)) unshallow.push(oid);
   }
-  // 4. The objects: everything reachable from the wanted roots and commits,
-  //    minus what the client holds.
-  const all = collectReachable([...wantRoots, ...included.keys()], lookup);
+  // 4. The objects: everything reachable from the wanted roots and the
+  //    depth-limited commits, minus what the client holds. The traversal
+  //    only follows a commit's parents while the parent is also in the
+  //    depth-limited set — otherwise a depth-1 clone would still carry the
+  //    whole history (the shallow boundary only hides it from `git log`).
+  const all = new Set<string>();
+  const walkQueue: string[] = [...wantRoots, ...included.keys()];
+  while (walkQueue.length) {
+    const oid = walkQueue.pop()!;
+    if (all.has(oid)) continue;
+    const object = lookup(oid);
+    if (!object) continue;
+    all.add(oid);
+    if (object.type === 'commit') {
+      if (!included.has(oid)) continue;
+      const commit = parseCommit(object.data);
+      walkQueue.push(commit.tree);
+      for (const parent of commit.parents) {
+        if (included.has(parent)) walkQueue.push(parent);
+      }
+    } else if (object.type === 'tag') {
+      walkQueue.push(parseTag(object.data).object);
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) {
+        if (entry.mode === '160000') continue;
+        walkQueue.push(entry.oid);
+      }
+    }
+  }
   const objects: GitObject[] = [];
   for (const oid of all) {
     if (haveSet.has(oid)) continue;
